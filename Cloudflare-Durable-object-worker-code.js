@@ -28,8 +28,6 @@ var ChatRoom = class {
   constructor(state, env) {
     this.state = state;
     this.env = env;
-    this.GROUP_CALL_KEY = "group_call_state";
-    this.GROUP_CALL_TTL_MS = 5 * 60 * 1000;
   }
 
   async _hmacSha256Base64(secret, msg) {
@@ -112,64 +110,6 @@ var ChatRoom = class {
     return messages.filter(m => Number(m.time || m.ts || m.timestamp || 0) > cutoff);
   }
 
-  async _getGroupCallState() {
-    const s = await this.state.storage.get(this.GROUP_CALL_KEY);
-    if (!s || !s.active) return null;
-    const now = Date.now();
-    if (!s.updated_at || (now - Number(s.updated_at)) > this.GROUP_CALL_TTL_MS) {
-      await this.state.storage.delete(this.GROUP_CALL_KEY);
-      return null;
-    }
-    return s;
-  }
-
-  async _saveGroupCallState(st) {
-    await this.state.storage.put(this.GROUP_CALL_KEY, st);
-  }
-
-  async _touchGroupCall(roomName, fallbackHost) {
-    let st = await this._getGroupCallState();
-    if (!st) {
-      st = {
-        active: true,
-        host: fallbackHost || null,
-        members: [],
-        started_at: Date.now(),
-        updated_at: Date.now()
-      };
-    }
-    st.updated_at = Date.now();
-    if (!Array.isArray(st.members)) st.members = [];
-    const online = new Set(
-      this.state.getWebSockets(roomName)
-        .map(ws => ws.deserializeAttachment())
-        .filter(Boolean)
-        .map(a => a.username)
-    );
-    st.members = st.members.filter(u => online.has(u));
-    await this._saveGroupCallState(st);
-    return st;
-  }
-
-  async _endGroupCall() {
-    await this.state.storage.delete(this.GROUP_CALL_KEY);
-  }
-
-  _notifyActivity(roomName, now) {
-    (async () => {
-      try {
-        const accountBase = this.env.ACCOUNT_BASE || "https://account-worker.anonymousguy.workers.dev";
-        const internalKey = this.env.INTERNAL_KEY || "";
-        if (!internalKey) return;
-        await fetch(`${accountBase}/room-activity`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-internal-key": internalKey },
-          body: JSON.stringify({ room: roomName, last_activity: now, increment: 1 })
-        }).catch(() => {});
-      } catch (e) {}
-    })();
-  }
-
   async fetch(request) {
     try {
       const url = new URL(request.url);
@@ -201,17 +141,6 @@ var ChatRoom = class {
         server.serializeAttachment({ username: wsUsername, room: roomName });
         this.state.acceptWebSocket(server, [roomName]);
         this._broadcastPresence(roomName);
-
-        const gc = await this._getGroupCallState();
-        if (gc && gc.active) {
-          try {
-            server.send(JSON.stringify({
-              type: "call-group-announce",
-              members: gc.members || [],
-              room: roomName
-            }));
-          } catch (e) {}
-        }
 
         return new Response(null, { status: 101, webSocket: client });
       }
@@ -265,79 +194,8 @@ var ChatRoom = class {
       let msg;
       try { msg = JSON.parse(message); } catch (e) { return; }
 
+      // 1:1 signaling only
       if (msg.type && msg.type.startsWith("call-")) {
-        const t = String(msg.type);
-        if (t === "call-group-invite") {
-          const existing = await this._getGroupCallState();
-          if (existing && existing.active) {
-            try {
-              ws.send(JSON.stringify({
-                type: "call-group-announce",
-                members: existing.members || [],
-                room
-              }));
-            } catch (e) {}
-            return;
-          }
-          const state = {
-            active: true,
-            host: username,
-            members: [username],
-            started_at: Date.now(),
-            updated_at: Date.now()
-          };
-          await this._saveGroupCallState(state);
-          this._broadcast(room, { type: "call-group-announce", members: state.members, room }, null);
-          return;
-        }
-
-        if (t === "call-group-join") {
-          const state = await this._touchGroupCall(room, username);
-          if (!state.active) return;
-          if (!state.members.includes(username)) state.members.push(username);
-          state.updated_at = Date.now();
-          await this._saveGroupCallState(state);
-          this._broadcast(room, { type: "call-group-join", _from: username, room }, ws);
-          this._broadcast(room, { type: "call-group-announce", members: state.members, room }, null);
-          return;
-        }
-
-        if (t === "call-group-announce") {
-          const state = await this._touchGroupCall(room, username);
-          if (!state) return;
-          if (!state.members.includes(username)) state.members.push(username);
-          await this._saveGroupCallState(state);
-          this._broadcast(room, { type: "call-group-announce", members: state.members, room }, null);
-          return;
-        }
-
-        if (t === "call-group-leave") {
-          const state = await this._getGroupCallState();
-          if (!state) return;
-          state.members = (state.members || []).filter(u => u !== username);
-          state.updated_at = Date.now();
-          if (state.members.length === 0) {
-            await this._endGroupCall();
-            this._broadcast(room, { type: "call-group-ended", room }, null);
-          } else {
-            if (state.host === username) state.host = state.members[0];
-            await this._saveGroupCallState(state);
-            this._broadcast(room, { type: "call-group-leave", _from: username, room }, ws);
-            this._broadcast(room, { type: "call-group-announce", members: state.members, room }, null);
-          }
-          return;
-        }
-
-        if (t === "call-group-ended") {
-          const state = await this._getGroupCallState();
-          if (state && (state.host === username || (state.members || []).length <= 1)) {
-            await this._endGroupCall();
-            this._broadcast(room, { type: "call-group-ended", room }, null);
-          }
-          return;
-        }
-
-        // 1:1 signaling
         const target = msg.to ? String(msg.to) : null;
         if (!target) return;
         msg._from = username;
@@ -363,24 +221,8 @@ var ChatRoom = class {
   async webSocketClose(ws, code, reason) {
     try {
       const att = ws.deserializeAttachment();
-      if (!att || !att.room || !att.username) return;
-      const room = att.room;
-      const username = att.username;
-      const st = await this._getGroupCallState();
-      if (st && st.active && Array.isArray(st.members) && st.members.includes(username)) {
-        st.members = st.members.filter(u => u !== username);
-        st.updated_at = Date.now();
-        if (st.members.length === 0) {
-          await this._endGroupCall();
-          this._broadcast(room, { type: "call-group-ended", room }, null);
-        } else {
-          if (st.host === username) st.host = st.members[0];
-          await this._saveGroupCallState(st);
-          this._broadcast(room, { type: "call-group-leave", _from: username, room }, ws);
-          this._broadcast(room, { type: "call-group-announce", members: st.members, room }, null);
-        }
-      }
-      this._broadcastPresence(room);
+      if (!att || !att.room) return;
+      this._broadcastPresence(att.room);
     } catch (e) {}
   }
 
@@ -389,6 +231,21 @@ var ChatRoom = class {
       const att = ws.deserializeAttachment();
       if (att && att.room) this._broadcastPresence(att.room);
     } catch (e) {}
+  }
+
+  _notifyActivity(roomName, now) {
+    (async () => {
+      try {
+        const accountBase = this.env.ACCOUNT_BASE || "https://account-worker.anonymousguy.workers.dev";
+        const internalKey = this.env.INTERNAL_KEY || "";
+        if (!internalKey) return;
+        await fetch(`${accountBase}/room-activity`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-internal-key": internalKey },
+          body: JSON.stringify({ room: roomName, last_activity: now, increment: 1 })
+        }).catch(() => {});
+      } catch (e) {}
+    })();
   }
 };
 
